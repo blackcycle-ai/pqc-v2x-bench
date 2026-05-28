@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pqc-v2x-bench"
+version = "0.1.0"
+description = "Reproducible benchmark suite for post-quantum cryptography primitives in V2X PKI contexts (ECDSA, ML-DSA, Falcon, SLH-DSA, ML-KEM, HQC)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Miguel Fornell", email = "miguel@blackcycle.ai" }
+]
+keywords = ["pqc", "v2x", "benchmark", "ml-dsa", "ml-kem", "falcon", "slh-dsa", "hqc", "cryptography", "post-quantum"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "cryptography>=42",
+    "pqcrypto>=0.3",
+    "tabulate>=0.9",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
+[project.scripts]
+pqc-v2x-bench = "pqc_v2x_bench.cli:app"
+
+[project.urls]
+Homepage = "https://pki.skyv2x.com"
+Repository = "https://github.com/blackcycle-ai/pqc-v2x-bench"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pqc_v2x_bench = ["baselines/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
