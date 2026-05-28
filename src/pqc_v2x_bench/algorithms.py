@@ -68,27 +68,46 @@ class Algorithm:
 # ---------------------------------------------------------------------------
 
 def _ecdsa_factory(curve_ctor: Callable[[], ec.EllipticCurve]) -> dict[str, Callable]:
-    """Build keygen/sign/verify closures over a cryptography EC curve."""
+    """Build keygen/sign/verify closures over a cryptography EC curve.
+
+    Parsed key objects are cached per raw-bytes representation so that
+    sign/verify do not pay the DER deserialization cost on every call —
+    a production CCMS endpoint loads the key once at boot and reuses it
+    for thousands of operations.
+    """
+    from cryptography.hazmat.primitives.serialization import load_der_private_key
+
+    _sk_cache: dict[bytes, ec.EllipticCurvePrivateKey] = {}
+    _pk_cache: dict[bytes, ec.EllipticCurvePublicKey] = {}
 
     def keygen() -> tuple[bytes, bytes]:
         sk = ec.generate_private_key(curve_ctor())
         pk = sk.public_key()
         pk_bytes = pk.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
         sk_bytes = sk.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
+        # Pre-populate caches with the freshly-built objects so the first
+        # sign/verify call on these bytes is already cold-free.
+        _sk_cache[sk_bytes] = sk
+        _pk_cache[pk_bytes] = pk
         return pk_bytes, sk_bytes
 
     def _hash_for(curve: ec.EllipticCurve) -> hashes.HashAlgorithm:
         return hashes.SHA256() if curve.key_size <= 256 else hashes.SHA384()
 
     def sign(_pk: bytes, sk_bytes: bytes, msg: bytes) -> bytes:
-        from cryptography.hazmat.primitives.serialization import load_der_private_key
-        sk = load_der_private_key(sk_bytes, password=None)
+        sk = _sk_cache.get(sk_bytes)
+        if sk is None:
+            sk = load_der_private_key(sk_bytes, password=None)
+            _sk_cache[sk_bytes] = sk
         return sk.sign(msg, ec.ECDSA(_hash_for(sk.curve)))
 
     def verify(pk_bytes: bytes, _sk: bytes, msg: bytes, sig: bytes) -> bool:
-        pk = ec.EllipticCurvePublicKey.from_encoded_point(curve_ctor(), pk_bytes)
+        pk = _pk_cache.get(pk_bytes)
+        if pk is None:
+            pk = ec.EllipticCurvePublicKey.from_encoded_point(curve_ctor(), pk_bytes)
+            _pk_cache[pk_bytes] = pk
         try:
-            pk.verify(sig, msg, ec.ECDSA(_hash_for(curve_ctor())))
+            pk.verify(sig, msg, ec.ECDSA(_hash_for(pk.curve)))
             return True
         except InvalidSignature:
             return False

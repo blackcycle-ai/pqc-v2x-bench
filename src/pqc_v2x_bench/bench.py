@@ -46,6 +46,11 @@ class AlgorithmResult:
     op2_ms_mean: float = 0.0
     op2_ms_std: float = 0.0
     iters: int = 0
+    # Optional raw samples (populated when bench is run with collect_raw=True).
+    # Empty lists in the default case keep the JSON schema stable but small.
+    raw_keygen_ms: list[float] = field(default_factory=list)
+    raw_op1_ms: list[float] = field(default_factory=list)
+    raw_op2_ms: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -179,38 +184,57 @@ def _summarize(values_us: list[float]) -> tuple[float, float, float, float]:
 # Bench loop
 # ---------------------------------------------------------------------------
 
-def _bench_sign(alg: Algorithm, iters: int, warmup: int, msg: bytes) -> AlgorithmResult:
+def _bench_sign(alg: Algorithm, iters: int, warmup: int, msg: bytes,
+                collect_raw: bool = False) -> AlgorithmResult:
+    """Bench a signature algorithm in two phases:
+
+    Phase 1 — keygen latency: N+warmup independent generations.
+    Phase 2 — sign/verify latency: one fixed keypair, N+warmup operations
+              (production-realistic: keys loaded once, reused).
+
+    This separation avoids ECDSA's DER parse cost being charged to every
+    sign/verify call when the underlying adapter caches parsed objects.
+    """
     kg: list[float] = []
     op1: list[float] = []
     op2: list[float] = []
     sig_size = pub_size = priv_size = 0
 
+    # Phase 1: keygen latency
     for i in range(iters + warmup):
         t0 = time.perf_counter_ns()
         pk, sk = alg.keygen()
         t1 = time.perf_counter_ns()
-        sig = alg.op1(pk, sk, msg)
-        t2 = time.perf_counter_ns()
-        ok = alg.op2(pk, sk, (msg, sig))
-        t3 = time.perf_counter_ns()
-        if not ok:
-            raise RuntimeError(f"{alg.name}: verify returned False (corrupted backend?)")
-
         if i < warmup:
             continue
         kg.append((t1 - t0) / 1000.0)
-        op1.append((t2 - t1) / 1000.0)
-        op2.append((t3 - t2) / 1000.0)
-        if sig_size == 0:
-            sig_size, pub_size, priv_size = len(sig), len(pk), len(sk)
+        if pub_size == 0:
+            pub_size, priv_size = len(pk), len(sk)
         else:
             if len(pk) != pub_size or len(sk) != priv_size:
                 raise RuntimeError(f"{alg.name}: key size drift mid-run")
 
+    # Phase 2: sign/verify on one fixed keypair
+    pk_fixed, sk_fixed = alg.keygen()
+    for i in range(iters + warmup):
+        t2a = time.perf_counter_ns()
+        sig = alg.op1(pk_fixed, sk_fixed, msg)
+        t2b = time.perf_counter_ns()
+        ok = alg.op2(pk_fixed, sk_fixed, (msg, sig))
+        t2c = time.perf_counter_ns()
+        if not ok:
+            raise RuntimeError(f"{alg.name}: verify returned False (corrupted backend?)")
+        if i < warmup:
+            continue
+        op1.append((t2b - t2a) / 1000.0)
+        op2.append((t2c - t2b) / 1000.0)
+        if sig_size == 0:
+            sig_size = len(sig)
+
     p_kg = _summarize(kg)
     p_o1 = _summarize(op1)
     p_o2 = _summarize(op2)
-    return AlgorithmResult(
+    result = AlgorithmResult(
         algorithm=alg.name, kind="sign", family=alg.family, nist_level=alg.nist_level,
         sig_size=sig_size, pubkey_size=pub_size, privkey_size=priv_size,
         keygen_ms_p50=p_kg[0], keygen_ms_p95=p_kg[1], keygen_ms_mean=p_kg[2], keygen_ms_std=p_kg[3],
@@ -218,37 +242,53 @@ def _bench_sign(alg: Algorithm, iters: int, warmup: int, msg: bytes) -> Algorith
         op2_ms_p50=p_o2[0], op2_ms_p95=p_o2[1], op2_ms_mean=p_o2[2], op2_ms_std=p_o2[3],
         iters=iters,
     )
+    if collect_raw:
+        result.raw_keygen_ms = kg
+        result.raw_op1_ms = op1
+        result.raw_op2_ms = op2
+    return result
 
 
-def _bench_kem(alg: Algorithm, iters: int, warmup: int, _msg: bytes) -> AlgorithmResult:
+def _bench_kem(alg: Algorithm, iters: int, warmup: int, _msg: bytes,
+               collect_raw: bool = False) -> AlgorithmResult:
+    """Bench a KEM in two phases (keygen alone, then encaps/decaps on fixed key)."""
     kg: list[float] = []
     op1: list[float] = []
     op2: list[float] = []
     ct_size = pub_size = priv_size = ss_size = 0
 
+    # Phase 1: keygen
     for i in range(iters + warmup):
         t0 = time.perf_counter_ns()
         pk, sk = alg.keygen()
         t1 = time.perf_counter_ns()
-        ct, ss = alg.op1(pk, sk, b"")
-        t2 = time.perf_counter_ns()
-        ss2 = alg.op2(pk, sk, (ct, ss))
-        t3 = time.perf_counter_ns()
-        if ss != ss2:
-            raise RuntimeError(f"{alg.name}: KEM shared secret mismatch")
-
         if i < warmup:
             continue
         kg.append((t1 - t0) / 1000.0)
-        op1.append((t2 - t1) / 1000.0)
-        op2.append((t3 - t2) / 1000.0)
+        if pub_size == 0:
+            pub_size, priv_size = len(pk), len(sk)
+
+    # Phase 2: encaps/decaps on fixed keypair
+    pk_fixed, sk_fixed = alg.keygen()
+    for i in range(iters + warmup):
+        t2a = time.perf_counter_ns()
+        ct, ss = alg.op1(pk_fixed, sk_fixed, b"")
+        t2b = time.perf_counter_ns()
+        ss2 = alg.op2(pk_fixed, sk_fixed, (ct, ss))
+        t2c = time.perf_counter_ns()
+        if ss != ss2:
+            raise RuntimeError(f"{alg.name}: KEM shared secret mismatch")
+        if i < warmup:
+            continue
+        op1.append((t2b - t2a) / 1000.0)
+        op2.append((t2c - t2b) / 1000.0)
         if ct_size == 0:
-            ct_size, pub_size, priv_size, ss_size = len(ct), len(pk), len(sk), len(ss)
+            ct_size, ss_size = len(ct), len(ss)
 
     p_kg = _summarize(kg)
     p_o1 = _summarize(op1)
     p_o2 = _summarize(op2)
-    return AlgorithmResult(
+    result = AlgorithmResult(
         algorithm=alg.name, kind="kem", family=alg.family, nist_level=alg.nist_level,
         sig_size=ct_size, pubkey_size=pub_size, privkey_size=priv_size,
         shared_secret_size=ss_size,
@@ -257,10 +297,16 @@ def _bench_kem(alg: Algorithm, iters: int, warmup: int, _msg: bytes) -> Algorith
         op2_ms_p50=p_o2[0], op2_ms_p95=p_o2[1], op2_ms_mean=p_o2[2], op2_ms_std=p_o2[3],
         iters=iters,
     )
+    if collect_raw:
+        result.raw_keygen_ms = kg
+        result.raw_op1_ms = op1
+        result.raw_op2_ms = op2
+    return result
 
 
 def bench_one(alg: Algorithm, iters: int = 100, warmup: int = 5,
-              msg_size: int = 256, msg: bytes | None = None) -> AlgorithmResult:
+              msg_size: int = 256, msg: bytes | None = None,
+              collect_raw: bool = False) -> AlgorithmResult:
     """Bench a single algorithm. msg overrides msg_size when provided."""
     if iters <= 0:
         raise ValueError("iters must be >= 1")
@@ -268,27 +314,30 @@ def bench_one(alg: Algorithm, iters: int = 100, warmup: int = 5,
         raise ValueError("warmup must be >= 0")
     payload = msg if msg is not None else os.urandom(msg_size)
     if alg.kind == "sign":
-        return _bench_sign(alg, iters, warmup, payload)
+        return _bench_sign(alg, iters, warmup, payload, collect_raw=collect_raw)
     if alg.kind == "kem":
-        return _bench_kem(alg, iters, warmup, payload)
+        return _bench_kem(alg, iters, warmup, payload, collect_raw=collect_raw)
     raise ValueError(f"unknown algorithm kind: {alg.kind}")
 
 
 def bench_many(algs: Iterable[Algorithm], *, iters: int = 100, warmup: int = 5,
-               msg_size: int = 256, progress=None) -> BenchReport:
+               msg_size: int = 256, progress=None,
+               collect_raw: bool = False) -> BenchReport:
     """Bench a list of algorithms and assemble a BenchReport."""
     algs = list(algs)
     # Shared payload across all sign algorithms keeps comparisons fair.
     msg = os.urandom(msg_size)
     out = BenchReport(
         host=detect_host(),
-        params={"iters": iters, "warmup": warmup, "msg_size": msg_size},
+        params={"iters": iters, "warmup": warmup, "msg_size": msg_size,
+                "collect_raw": collect_raw},
         results=[],
     )
     for alg in algs:
         if progress is not None:
             progress(alg.name)
-        out.results.append(bench_one(alg, iters=iters, warmup=warmup, msg=msg))
+        out.results.append(bench_one(alg, iters=iters, warmup=warmup, msg=msg,
+                                     collect_raw=collect_raw))
     return out
 
 
