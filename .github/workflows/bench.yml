@@ -1,0 +1,116 @@
+name: bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly at 03:17 UTC — keeps the `nightly` branch fresh on both archs.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    name: bench (${{ matrix.arch }} / py${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+            python-version: "3.11"
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            python-version: "3.11"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Show host
+        run: |
+          uname -a
+          python --version
+          if [ -f /proc/cpuinfo ]; then grep -m1 "model name" /proc/cpuinfo || true; fi
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+      - name: Run bench (iters=30, all algorithms)
+        run: |
+          pqc-v2x-bench run \
+            --iters 30 --warmup 3 \
+            --msg-size 256 \
+            --output json \
+            --out results-${{ matrix.arch }}.json \
+            --quiet
+
+      - name: Run bench (markdown report)
+        run: |
+          pqc-v2x-bench report \
+            results-${{ matrix.arch }}.json \
+            --output markdown \
+            --out report-${{ matrix.arch }}.md
+
+      - name: Compare against bundled baseline
+        run: |
+          pqc-v2x-bench compare \
+            src/pqc_v2x_bench/baselines/baseline_i7_13620h.json \
+            results-${{ matrix.arch }}.json \
+            --threshold 50 --output markdown || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.arch }}
+          path: |
+            results-${{ matrix.arch }}.json
+            report-${{ matrix.arch }}.md
+
+  publish-nightly:
+    name: Publish to nightly branch
+    needs: bench
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all bench artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./_nightly
+
+      - name: Commit results to nightly branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "skyv2x-bot"
+          git config user.email "bot@skyv2x.com"
+          # Refresh the orphan nightly branch atomically.
+          git checkout --orphan nightly
+          git rm -rf . >/dev/null 2>&1 || true
+          mkdir -p nightly
+          find _nightly -type f \( -name "results-*.json" -o -name "report-*.md" \) \
+            -exec cp {} nightly/ \;
+          echo "Nightly bench results — generated $(date -u +"%Y-%m-%dT%H:%M:%SZ")" > nightly/README.md
+          git add nightly
+          git commit -m "nightly bench $(date -u +"%Y-%m-%d")"
+          git push --force origin nightly
