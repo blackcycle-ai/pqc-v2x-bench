@@ -67,6 +67,11 @@ def cmd_run(
     out_file: Optional[Path] = typer.Option(
         None, "--out", help="Write to this file instead of stdout. Default: results.{ext}.",
     ),
+    raw_out: Optional[Path] = typer.Option(
+        None, "--raw-out",
+        help="Path to write raw per-iteration timings (JSON). Required for"
+             " descriptive analysis (convergence plots, distribution, outliers).",
+    ),
     quiet: bool = typer.Option(False, "--quiet", "-q",
                                help="Suppress per-algorithm progress messages."),
 ) -> None:
@@ -85,9 +90,10 @@ def cmd_run(
         raise typer.Exit(code=2)
 
     if not quiet:
+        raw_flag = " +raw" if raw_out else ""
         typer.echo(
             f"# pqc-v2x-bench {__version__} | iters={iters} warmup={warmup} "
-            f"msg_size={msg_size}B algorithms={len(selected)}",
+            f"msg_size={msg_size}B algorithms={len(selected)}{raw_flag}",
             err=True,
         )
 
@@ -97,7 +103,36 @@ def cmd_run(
 
     report = bench_mod.bench_many(
         selected, iters=iters, warmup=warmup, msg_size=msg_size, progress=_progress,
+        collect_raw=bool(raw_out),
     )
+
+    if raw_out is not None:
+        import json
+        raw_payload = {
+            "schema_version": report.schema_version,
+            "tool_version": report.tool_version,
+            "host": report.host,
+            "params": report.params,
+            "samples": [
+                {
+                    "algorithm": r.algorithm,
+                    "kind": r.kind,
+                    "family": r.family,
+                    "keygen_ms": r.raw_keygen_ms,
+                    "op1_ms": r.raw_op1_ms,
+                    "op2_ms": r.raw_op2_ms,
+                }
+                for r in report.results
+            ],
+        }
+        raw_out.write_text(json.dumps(raw_payload), encoding="utf-8")
+        if not quiet:
+            typer.echo(f"wrote raw samples to {raw_out}", err=True)
+        # Strip raw lists from the summary report so default output stays small
+        for r in report.results:
+            r.raw_keygen_ms = []
+            r.raw_op1_ms = []
+            r.raw_op2_ms = []
     text = report_mod.format_report(report, "markdown" if fmt == "md" else fmt)
 
     if out_file is None:
