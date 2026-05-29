@@ -1,12 +1,26 @@
-"""Algorithm registry.
+"""Algorithm registry — homogeneous-libcrypto port.
 
-Each algorithm is wrapped in a small adapter that exposes a uniform
-keygen/op1/op2 interface to the bench loop. Two operation families
-are supported: signatures (op1=sign, op2=verify) and KEMs
-(op1=encapsulate, op2=decapsulate).
+Branch: `homogeneous-libcrypto`. Compared to `main`, the PQC adapters
+no longer go through `pqcrypto` (PQClean reference C). They go through
+`liboqs-python` 0.12.0, which dispatches to liboqs 0.15.0 — built with
+AArch64 NEON + ARMv8 crypto extensions on Cortex-A78AE and verified-
+formally `mlkem-native` / `mldsa-native` paths.
 
-The registry is intentionally thin so new backends (e.g. oqs-python)
-can be added by appending entries — no inheritance hierarchies.
+ECDSA adapters keep `cryptography` (pyca), which is recompiled from
+source against the same OpenSSL 3.5.6 install used by liboqs. The two
+backends share a libcrypto root and ISA-level optimizations, closing
+the implementation-asymmetry confound flagged by reviewers of the
+HNDL CCMS preprint.
+
+Residual caveat (must stay in paper Limitations): `cryptography` goes
+through EVP_PKEY → libcrypto, while `liboqs-python` calls the liboqs
+C API directly. Both backends are compiled with the same optimization
+flags and target ISA, but they do not share dispatch paths. The
+implementation-asymmetry is minimized, not eliminated.
+
+Two operation families, uniform interface:
+  - signatures: op1=sign, op2=verify
+  - KEMs: op1=encapsulate, op2=decapsulate
 """
 from __future__ import annotations
 
@@ -23,25 +37,10 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
 )
 
-# PQC sign modules. Fail loudly if any are missing — silent skips would
-# produce a bench table where algorithms vanish without warning.
-from pqcrypto.sign import (
-    falcon_512,
-    falcon_1024,
-    ml_dsa_44,
-    ml_dsa_65,
-    ml_dsa_87,
-    sphincs_sha2_128f_simple,
-    sphincs_sha2_128s_simple,
-)
-from pqcrypto.kem import (
-    hqc_128,
-    hqc_192,
-    hqc_256,
-    ml_kem_512,
-    ml_kem_768,
-    ml_kem_1024,
-)
+# liboqs-python (oqs) — single PQ backend for all post-quantum families.
+# Fail loudly at import time: silent skips would produce a bench table
+# where algorithms vanish without warning.
+import oqs
 
 
 Kind = str  # "sign" | "kem"
@@ -64,7 +63,7 @@ class Algorithm:
 
 
 # ---------------------------------------------------------------------------
-# ECDSA adapters (sign family)
+# ECDSA adapters (sign family) — IDENTICAL to main branch
 # ---------------------------------------------------------------------------
 
 def _ecdsa_factory(curve_ctor: Callable[[], ec.EllipticCurve]) -> dict[str, Callable]:
@@ -85,8 +84,6 @@ def _ecdsa_factory(curve_ctor: Callable[[], ec.EllipticCurve]) -> dict[str, Call
         pk = sk.public_key()
         pk_bytes = pk.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
         sk_bytes = sk.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
-        # Pre-populate caches with the freshly-built objects so the first
-        # sign/verify call on these bytes is already cold-free.
         _sk_cache[sk_bytes] = sk
         _pk_cache[pk_bytes] = pk
         return pk_bytes, sk_bytes
@@ -137,71 +134,143 @@ def _make_ecdsa(name: str, curve_ctor: Callable[[], ec.EllipticCurve], level: st
 
 
 # ---------------------------------------------------------------------------
-# PQ sign adapters (pqcrypto modules)
+# PQ sign adapters via liboqs-python
 # ---------------------------------------------------------------------------
+#
+# liboqs-python `Signature` is stateful: each `sign()` call needs a
+# Signature object holding the secret key. We cache one signer object
+# per sk_bytes (analogous to the ECDSA _sk_cache pattern) so sign latency
+# does not include the cost of re-loading the key into liboqs internal
+# state on every iteration. Verifier objects are stateless (no key in
+# constructor), but caching them anyway saves Python-side allocation.
+#
+# Caveat: `oqs.Signature(name, sk)` keeps the secret key as a Python-side
+# bytearray that liboqs reads via ctypes. The cache holds Python objects,
+# not raw C pointers — no use-after-free risk.
 
-def _make_pq_sign(name: str, module, level: str, family: str) -> Algorithm:
+def _make_oqs_sign(display_name: str, oqs_name: str, level: str, family: str) -> Algorithm:
+    _signer_cache: dict[bytes, "oqs.Signature"] = {}
+    _verifier: "oqs.Signature | None" = None
+
+    def _get_verifier() -> "oqs.Signature":
+        nonlocal _verifier
+        if _verifier is None:
+            _verifier = oqs.Signature(oqs_name)
+        return _verifier
+
     def keygen() -> tuple[bytes, bytes]:
-        return module.generate_keypair()
+        signer = oqs.Signature(oqs_name)
+        pk = signer.generate_keypair()
+        sk = signer.export_secret_key()
+        # Pre-populate cache so first sign() does not pay re-instantiation.
+        _signer_cache[sk] = oqs.Signature(oqs_name, sk)
+        return pk, sk
 
-    def op1(pk: bytes, sk: bytes, msg: bytes) -> bytes:
-        return module.sign(sk, msg)
+    def op1(_pk: bytes, sk: bytes, msg: bytes) -> bytes:
+        signer = _signer_cache.get(sk)
+        if signer is None:
+            signer = oqs.Signature(oqs_name, sk)
+            _signer_cache[sk] = signer
+        return signer.sign(msg)
 
-    def op2(pk: bytes, sk: bytes, msg_sig: tuple[bytes, bytes]) -> bool:
+    def op2(pk: bytes, _sk: bytes, msg_sig: tuple[bytes, bytes]) -> bool:
         msg, sig = msg_sig
-        return bool(module.verify(pk, msg, sig))
+        verifier = _get_verifier()
+        return bool(verifier.verify(msg, sig, pk))
 
-    return Algorithm(name=name, kind="sign", nist_level=level, family=family,
-                     keygen=keygen, op1=op1, op2=op2)
+    return Algorithm(
+        name=display_name,
+        kind="sign",
+        nist_level=level,
+        family=family,
+        keygen=keygen,
+        op1=op1,
+        op2=op2,
+    )
 
 
 # ---------------------------------------------------------------------------
-# PQ KEM adapters
+# PQ KEM adapters via liboqs-python
 # ---------------------------------------------------------------------------
 
-def _make_pq_kem(name: str, module, level: str, family: str) -> Algorithm:
+def _make_oqs_kem(display_name: str, oqs_name: str, level: str, family: str) -> Algorithm:
+    _decapsulator_cache: dict[bytes, "oqs.KeyEncapsulation"] = {}
+    _encapsulator: "oqs.KeyEncapsulation | None" = None
+
+    def _get_encapsulator() -> "oqs.KeyEncapsulation":
+        nonlocal _encapsulator
+        if _encapsulator is None:
+            _encapsulator = oqs.KeyEncapsulation(oqs_name)
+        return _encapsulator
+
     def keygen() -> tuple[bytes, bytes]:
-        return module.generate_keypair()
+        kem = oqs.KeyEncapsulation(oqs_name)
+        pk = kem.generate_keypair()
+        sk = kem.export_secret_key()
+        _decapsulator_cache[sk] = oqs.KeyEncapsulation(oqs_name, sk)
+        return pk, sk
 
-    def op1(pk: bytes, sk: bytes, _msg: bytes) -> tuple[bytes, bytes]:
+    def op1(pk: bytes, _sk: bytes, _msg: bytes) -> tuple[bytes, bytes]:
         # encapsulate -> (ciphertext, shared_secret)
-        return module.encrypt(pk)
+        encap = _get_encapsulator()
+        ct, ss = encap.encap_secret(pk)
+        return ct, ss
 
-    def op2(pk: bytes, sk: bytes, ct_ss: tuple[bytes, bytes]) -> bytes:
+    def op2(_pk: bytes, sk: bytes, ct_ss: tuple[bytes, bytes]) -> bytes:
         ct, _ss = ct_ss
-        return module.decrypt(sk, ct)
+        decap = _decapsulator_cache.get(sk)
+        if decap is None:
+            decap = oqs.KeyEncapsulation(oqs_name, sk)
+            _decapsulator_cache[sk] = decap
+        return decap.decap_secret(ct)
 
-    return Algorithm(name=name, kind="kem", nist_level=level, family=family,
-                     keygen=keygen, op1=op1, op2=op2)
+    return Algorithm(
+        name=display_name,
+        kind="kem",
+        nist_level=level,
+        family=family,
+        keygen=keygen,
+        op1=op1,
+        op2=op2,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+#
+# Display names kept identical to main branch for tooling/figures
+# compatibility. The `oqs_name` second column is the liboqs canonical
+# mechanism name — verify with `oqs.get_enabled_sig_mechanisms()` and
+# `oqs.get_enabled_kem_mechanisms()` on the target host.
 
 REGISTRY: tuple[Algorithm, ...] = (
-    # Classical baselines
+    # Classical baselines via pyca/cryptography → OpenSSL 3.5.6 libcrypto
     _make_ecdsa("ECDSA-P256", ec.SECP256R1, "~L1 (128-bit)"),
     _make_ecdsa("ECDSA-BP256r1", ec.BrainpoolP256R1, "~L1 (128-bit)"),
     _make_ecdsa("ECDSA-BP384r1", ec.BrainpoolP384R1, "~L3 (192-bit)"),
-    # FIPS-204 ML-DSA (lattice, sign)
-    _make_pq_sign("ML-DSA-44", ml_dsa_44, "NIST L2", "ML-DSA"),
-    _make_pq_sign("ML-DSA-65", ml_dsa_65, "NIST L3", "ML-DSA"),
-    _make_pq_sign("ML-DSA-87", ml_dsa_87, "NIST L5", "ML-DSA"),
+    # FIPS-204 ML-DSA (lattice, sign) via liboqs 0.15 mldsa-native AArch64
+    _make_oqs_sign("ML-DSA-44", "ML-DSA-44", "NIST L2", "ML-DSA"),
+    _make_oqs_sign("ML-DSA-65", "ML-DSA-65", "NIST L3", "ML-DSA"),
+    _make_oqs_sign("ML-DSA-87", "ML-DSA-87", "NIST L5", "ML-DSA"),
     # Falcon (lattice, sign — pending FIPS-206 ratification)
-    _make_pq_sign("Falcon-512", falcon_512, "NIST L1", "Falcon"),
-    _make_pq_sign("Falcon-1024", falcon_1024, "NIST L5", "Falcon"),
+    _make_oqs_sign("Falcon-512", "Falcon-512", "NIST L1", "Falcon"),
+    _make_oqs_sign("Falcon-1024", "Falcon-1024", "NIST L5", "Falcon"),
     # FIPS-205 SLH-DSA (hash-based, sign)
-    _make_pq_sign("SLH-DSA-128s", sphincs_sha2_128s_simple, "NIST L1", "SLH-DSA"),
-    _make_pq_sign("SLH-DSA-128f", sphincs_sha2_128f_simple, "NIST L1", "SLH-DSA"),
-    # FIPS-203 ML-KEM (lattice, KEM)
-    _make_pq_kem("ML-KEM-512", ml_kem_512, "NIST L1", "ML-KEM"),
-    _make_pq_kem("ML-KEM-768", ml_kem_768, "NIST L3", "ML-KEM"),
-    _make_pq_kem("ML-KEM-1024", ml_kem_1024, "NIST L5", "ML-KEM"),
-    # NIST round-4 alternative KEM (code-based)
-    _make_pq_kem("HQC-128", hqc_128, "NIST L1", "HQC"),
-    _make_pq_kem("HQC-192", hqc_192, "NIST L3", "HQC"),
-    _make_pq_kem("HQC-256", hqc_256, "NIST L5", "HQC"),
+    _make_oqs_sign("SLH-DSA-128s", "SPHINCS+-SHA2-128s-simple", "NIST L1", "SLH-DSA"),
+    _make_oqs_sign("SLH-DSA-128f", "SPHINCS+-SHA2-128f-simple", "NIST L1", "SLH-DSA"),
+    # FIPS-203 ML-KEM (lattice, KEM) via liboqs 0.15 mlkem-native AArch64
+    _make_oqs_kem("ML-KEM-512", "ML-KEM-512", "NIST L1", "ML-KEM"),
+    _make_oqs_kem("ML-KEM-768", "ML-KEM-768", "NIST L3", "ML-KEM"),
+    _make_oqs_kem("ML-KEM-1024", "ML-KEM-1024", "NIST L5", "ML-KEM"),
+    # NIST round-4 alternative KEM (code-based) — DISABLED in liboqs 0.15
+    # default build pending security audit re-validation of timing
+    # side-channel disclosed in 2024. The paper retains the original
+    # `pqcrypto` HQC numbers (from main branch run) for context; this
+    # branch's runs report 13/16 algorithms.
+    # _make_oqs_kem("HQC-128", "HQC-128", "NIST L1", "HQC"),
+    # _make_oqs_kem("HQC-192", "HQC-192", "NIST L3", "HQC"),
+    # _make_oqs_kem("HQC-256", "HQC-256", "NIST L5", "HQC"),
 )
 
 
