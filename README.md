@@ -25,8 +25,6 @@ x86_64 and ARM64.
 ## Quickstart
 
 ```bash
-pip install pqc-v2x-bench    # PyPI
-# ...or, from source
 git clone https://github.com/blackcycle-ai/pqc-v2x-bench
 cd pqc-v2x-bench
 pip install -e .
